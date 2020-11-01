@@ -3,12 +3,109 @@ import subprocess
 import os
 import sys
 import enum
+from abc import abstractmethod, ABCMeta
+import resource
+import datetime
+import time
+from tabulate import tabulate
+from hurry.filesize import size
+import logging
 
 
 class Status(enum.Enum):
     OK = 0
     RUNTIME_ERROR = 1
     WRONG_ANSWER = 2
+
+
+class Test:
+
+    def __init__(self, directory, input_file, output_file):
+        self._in = Test._join(directory, input_file)
+        self._out = Test._join(directory, output_file)
+        self.status = None
+        self.answer = ''
+        self.output = ''
+        self.time = None
+        self.memory = None
+
+    @staticmethod
+    def _join(directory, file):
+        return os.path.join(directory if directory else '', file)
+
+    def read_input(self):
+        return read_file(self._in)
+
+    def read_answer(self):
+        return read_file(self._out).strip()
+
+
+class Program(metaclass=ABCMeta):
+
+    def __init__(self, path):
+        self._path = path
+
+    @abstractmethod
+    def run(self, test):
+        pass
+
+    def _run(self, binary, test):
+        usage_start = resource.getrusage(resource.RUSAGE_CHILDREN)
+        then = time.time()
+
+        # TODO: Handle timeouts
+        res = subprocess.run([binary, self._path], input=test.read_input().encode('utf-8'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+
+        err = res.stderr.decode('utf-8').strip()
+
+        if len(err) > 0:
+            logging.info('RE {}\n{}'.format(test._in, err))
+
+        usage_end = resource.getrusage(resource.RUSAGE_CHILDREN)
+        now = time.time()
+
+        if res.returncode != 0:
+            test.status = Status.RUNTIME_ERROR
+        else:
+            test.answer = test.read_answer()
+            test.output = res.stdout.decode('utf-8').strip()
+            test.status = Status.OK if test.answer == test.output else Status.WRONG_ANSWER
+
+        if test.status == Status.WRONG_ANSWER:
+            logging.info('WA {}\nExpected:\n{}\nGot:\n{}\n'.format(test._in, test.answer, test.output))
+
+        test.time = datetime.timedelta(seconds=now - then)
+
+        # TODO: Fix memory usage
+        test.memory = usage_end.ru_maxrss - usage_start.ru_maxrss
+
+
+class CompiledProgram(Program):
+
+    def __init__(self, path):
+        super().__init__(path)
+
+    @abstractmethod
+    def compile(self):
+        pass
+
+
+class PythonProgram(Program):
+
+    def __init__(self, path):
+        super().__init__(path)
+
+    def run(self, test):
+        self._run('python', test)
+
+
+def create_program(program_path):
+    file, ext = os.path.splitext(program_path)
+
+    if ext == '.py':
+        return PythonProgram(program_path)
+    else:
+        raise ValueError('Unknown program extension {}'.format(ext))
 
 
 def read_file(path):
@@ -20,49 +117,32 @@ def read_file(path):
         return None
 
 
-def run_test(program, input, output, i):
-    res = subprocess.run(['python', program], input=input.encode('utf-8'), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    status = None
-
-    if res.returncode != 0:
-        status = Status.RUNTIME_ERROR
-    else:
-        prog_output = res.stdout.decode('utf-8').strip()
-        output = output.strip()
-        status = Status.OK if prog_output == output else Status.WRONG_ANSWER
-
-    print(i, end=' ')
-
-    if status == Status.RUNTIME_ERROR:
-        print('RE')
-    elif status == Status.WRONG_ANSWER:
-        print('WA\n\tExpected:\n\t{}\n\tGot:\n\t{}'.format(output, prog_output))
-    else:
-        print('OK')
-
-
 def test(args):
-    print('[Testing {} | {} test(s)]'.format(args.program, args.n))
+    logging.basicConfig(filename=args.l, filemode='w', level=logging.INFO)
 
-    input = os.path.join(args.d if args.d else '', 'i')
-    output = os.path.join(args.d if args.d else '', 'o')
+    tests = [Test(args.d, 'i%s' % i, 'o%s' % i) for i in range(1, args.n + 1)]
+    program = create_program(args.program)
 
-    print('[Dir = {} | Input = {}* | Output = {}*]'.format(args.d, input, output))
+    print(tabulate([(args.program, args.d, args.n)], headers=['Program', 'Directory', 'Number of tests']), end='\n\n')
 
-    for i in range(1, args.n + 1):
-        input_cont = read_file(input + str(i))
+    for test in tests:
+        program.run(test)
 
-        if not input_cont:
-            print('{} [Cannot open {}]'.format(i, input + str(i)))
-            continue
+    tests_data = [None] * len(tests)
 
-        output_cont = read_file(output + str(i))
+    for i, test in enumerate(tests):
+        status = None
 
-        if not output_cont:
-            print('{} [Cannot open {}]'.format(i, output + str(i)))
-            continue
+        if test.status == Status.RUNTIME_ERROR:
+            status = 'RE'
+        elif test.status == Status.WRONG_ANSWER:
+            status = 'WA'
+        elif test.status == Status.OK:
+            status = 'OK'
 
-        run_test(args.program, input_cont, output_cont, i)
+        tests_data[i] = (i + 1, status, '{:.2f}s'.format(test.time.total_seconds()), size(test.memory))
+
+    print(tabulate(tests_data, headers=['Index', 'Status', 'Time', 'Memory']))
 
 
 def generate(args):
@@ -76,10 +156,10 @@ def generate(args):
     created_tests = 0
 
     for i in range(1, args.n + 1):
-        res_i = subprocess.run(['python', args.generator], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        res_i = subprocess.run(['python', args.generator], stdout=subprocess.PIPE)
 
         if res_i.returncode == 0:
-            res_o = subprocess.run(['python', args.program], input=res_i.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            res_o = subprocess.run(['python', args.program], input=res_i.stdout, stdout=subprocess.PIPE)
 
             if res_o.returncode == 0:
                 with open(input + str(i), 'w+') as f:
@@ -108,6 +188,7 @@ def main():
     test_parser.add_argument('program', nargs='?', action=FileAction, help='Path to program')
     test_parser.add_argument('-d', action=FileAction, help='Tests directory')
     test_parser.add_argument('-n', type=int, default=1, help='Number of tests')
+    test_parser.add_argument('-l', default='contest.log', help='Path to log file')
     test_parser.set_defaults(func=test)
 
     gen_parser = subparser.add_parser('generate', help='Generate tests')
