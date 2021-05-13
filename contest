@@ -1,0 +1,3 @@
+CONTEST_PATH=/Users/kirillkorolev/dsba/contest/
+source $CONTEST_PATH/venv/bin/activate
+python $CONTEST_PATH/contest.py $@

@@ -46,29 +46,30 @@ class Program(metaclass=ABCMeta):
         self._path = path
 
     @abstractmethod
-    def run(self, test):
+    def run_test(self, test):
         pass
 
-    def _run(self, binary, test):
-        #usage_start = resource.getrusage(resource.RUSAGE_CHILDREN)
+    @abstractmethod
+    def generate_test(self, generator):
+        pass
+
+    def _test(self, args, test):
         then = time.time()
 
         # TODO: Handle timeouts
-        res = subprocess.run([binary, self._path], input=test.read_input().encode('utf-8'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = proc.communicate(input=test.read_input().encode('utf-8'))
 
-        err = res.stderr.decode('utf-8').strip()
+        err = res[1].decode('utf-8').strip()
 
-        if len(err) > 0:
-            logging.info('RE {}\n{}'.format(test._in, err))
-
-        #usage_end = resource.getrusage(resource.RUSAGE_CHILDREN)
         now = time.time()
 
-        if res.returncode != 0:
+        if len(err) > 0:
             test.status = Status.RUNTIME_ERROR
+            logging.info('RE {}\n{}'.format(test._in, err))
         else:
             test.answer = test.read_answer()
-            test.output = res.stdout.decode('utf-8').strip()
+            test.output = res[0].decode('utf-8').strip()
             test.status = Status.OK if test.answer == test.output else Status.WRONG_ANSWER
 
         if test.status == Status.WRONG_ANSWER:
@@ -78,8 +79,24 @@ class Program(metaclass=ABCMeta):
 
         # TODO: Fix memory usage
         test.memory = 0
-        #test.memory = usage_end.ru_maxrss - usage_start.ru_maxrss
+        #test.memory = usage_end.ru_maxrss - usage_start.ru_maxrss'''
 
+    def _gen(self, args, generator, test):
+        #TODO: Handle RE
+        res_i = subprocess.run(['python', generator], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        if res_i.returncode == 0:
+            # TODO: Handle RE
+            res_o = subprocess.run(args, input=res_i.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            if res_o.returncode == 0:
+                with open(test._in, 'w+') as f:
+                    f.write(res_i.stdout.decode('utf-8'))
+                with open(test._out, 'w+') as f:
+                    f.write(res_o.stdout.decode('utf-8'))
+                return True
+            return False
+        return False
 
 class CompiledProgram(Program):
 
@@ -96,8 +113,27 @@ class PythonProgram(Program):
     def __init__(self, path):
         super().__init__(path)
 
-    def run(self, test):
-        self._run('python', test)
+    def _args(self):
+        return ['python', self._path]
+
+    def run_test(self, test):
+        self._test(self._args(), test)
+
+    def generate_test(self, generator, test):
+        return self._gen(self._args(), generator, test)
+
+class BinaryProgram(Program):
+    def __init__(self, path):
+        super().__init__(path)
+
+    def _args(self):
+        return [self._path]
+
+    def run_test(self, test):
+        self._test(self._args(), test)
+
+    def generate_test(self, generator, test):
+        return self._gen(self._args(), generator, test)
 
 
 def create_program(program_path):
@@ -105,6 +141,8 @@ def create_program(program_path):
 
     if ext == '.py':
         return PythonProgram(program_path)
+    elif len(ext) == 0:
+        return BinaryProgram(program_path)
     else:
         raise ValueError('Unknown program extension {}'.format(ext))
 
@@ -127,7 +165,7 @@ def test(args):
     print(tabulate([(args.program, args.d, args.n)], headers=['Program', 'Directory', 'Number of tests']), end='\n\n')
 
     for test in tests:
-        program.run(test)
+        program.run_test(test)
 
     tests_data = [None] * len(tests)
 
@@ -153,22 +191,11 @@ def generate(args):
     output = os.path.join(args.d if args.d else '', 'o')
 
     created_tests = 0
+    program = create_program(args.program)
 
     for i in range(1, args.n + 1):
-        #TODO: Handle RE
-        res_i = subprocess.run(['python', args.generator], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        if res_i.returncode == 0:
-            # TODO: Handle RE
-            res_o = subprocess.run(['python', args.program], input=res_i.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            if res_o.returncode == 0:
-                with open(input + str(i), 'w+') as f:
-                    f.write(res_i.stdout.decode('utf-8'))
-                with open(output + str(i), 'w+') as f:
-                    f.write(res_o.stdout.decode('utf-8'))
-
-                created_tests += 1
+        if program.generate_test(args.generator, Test(args.d, 'i%s' % i, 'o%s' % i)):
+            created_tests += 1
 
     print('[%s test(s) has been created]' % created_tests)
 
